@@ -2,29 +2,33 @@
 
 ########################################
 # Plot split PoPoolation2 FET files with BH-FDR (PNG)
+# Uses a shared genome coordinate system from genome_offsets.tsv
+#
 # Key behavior:
 # - BH-FDR computed on ALL points
 # - Plot shows ALL significant SNPs (q <= FDR_ALPHA)
 # - Thins ONLY the nonsignificant background for readability
+# - Forces identical x-axis across plots using genome_end from offsets file
+# - Optionally labels top significant hits as scaffold:position (ggrepel if available)
 #
 # Assumption: value after PAIR is already -log10(p)
-# (This matches your prior log: q99(val) ~ 3.18 -> treated as -log10(p))
 ########################################
 
 suppressPackageStartupMessages({
   library(data.table)
   library(ggplot2)
 })
+HAS_GGREPEL <- requireNamespace("ggrepel", quietly = TRUE)
 
 # -----------------------------
 # EDIT THESE
 # -----------------------------
-FETDIR  <- "/hb/groups/kay_lab/popoolation2/populations/LP4/sync_chunks"
-FAI     <- "/hb/groups/kay_lab/popoolation2/populations/LP2/refgenome.fai"
-PAIR    <- "1:2="
+FETDIR   <- "/hb/groups/kay_lab/popoolation2/populations/LP4/sync_chunks"
+OFFSETS  <- "/hb/groups/kay_lab/popoolation2/populations/LP2/genome_offsets.tsv"
+PAIR     <- "1:2="
 
-OUTDIR  <- file.path(FETDIR, "plots")
-OUTPNG  <- file.path(OUTDIR, "fet_manhattan_FDR_keepSigThinBg.png")
+OUTDIR   <- file.path(FETDIR, "plots")
+OUTPNG   <- file.path(OUTDIR, "fet_manhattan_FDR_keepSigThinBg.png")
 
 # FDR level
 FDR_ALPHA <- 0.05
@@ -41,7 +45,10 @@ PNG_HEIGHT_IN   <- 6
 PNG_DPI         <- 450
 
 # Optional y cap for readability (set Inf to disable)
-Y_CAP <- Inf  # e.g. 200 if extreme hits squash everything else
+Y_CAP <- Inf   # e.g. 200 if extreme hits squash everything else
+
+# Labeling controls
+LABEL_TOP_N <- 20               # label top N significant hits (set 0 to disable)
 
 pattern <- "\\.fet$"
 
@@ -56,14 +63,23 @@ cat("Found", length(fet_files), ".fet files\n")
 dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
 
 # -----------------------------
-# READ .FAI for scaffold ordering and offsets
+# READ genome offsets (shared coordinate system)
 # -----------------------------
-stopifnot(file.exists(FAI))
-fai <- fread(FAI, header = FALSE)
-setnames(fai, c("CHR","scaf_len","offset0","linebases","linewidth"))
-fai <- fai[, .(CHR = as.character(CHR), scaf_len = as.numeric(scaf_len))]
-setorder(fai, -scaf_len)                         # largest -> smallest
-fai[, offset := cumsum(shift(scaf_len, fill = 0))]
+stopifnot(file.exists(OFFSETS))
+genome <- fread(OFFSETS, sep = "\t", showProgress = FALSE)
+stopifnot(all(c("CHR","LEN","offset","end") %in% names(genome)))
+
+genome[, CHR := as.character(CHR)]
+genome[, LEN := suppressWarnings(as.numeric(LEN))]
+genome[, offset := suppressWarnings(as.numeric(offset))]
+genome[, end := suppressWarnings(as.numeric(end))]
+genome <- genome[is.finite(LEN) & is.finite(offset) & is.finite(end)]
+
+stopifnot(nrow(genome) > 0)
+genome_end <- max(genome$end, na.rm = TRUE)
+
+cat("Loaded genome offsets:", nrow(genome), "scaffolds\n")
+cat("Shared genome_end:", format(genome_end, scientific = FALSE), "\n")
 
 # -----------------------------
 # Robust read-one split .FET file + parse PAIR column
@@ -154,6 +170,7 @@ cat("\nComputing BH-FDR across", nrow(dt), "tests...\n")
 dt[, q := p.adjust(p, method = "BH")]
 
 sig <- dt[q <= FDR_ALPHA]
+
 if (nrow(sig) == 0) {
   fdr_line <- NA_real_
   cat("No SNPs pass FDR <", FDR_ALPHA, "\n")
@@ -165,14 +182,33 @@ if (nrow(sig) == 0) {
 }
 
 # -----------------------------
-# cumulative coordinate
+# cumulative coordinate using shared genome offsets
 # -----------------------------
-dt <- merge(dt, fai, by = "CHR", all.x = TRUE, sort = FALSE)
-stopifnot(all(!is.na(dt$offset)))
+dt <- merge(dt, genome[, .(CHR, offset)], by = "CHR", all.x = TRUE, sort = FALSE)
+if (any(is.na(dt$offset))) {
+  missing <- unique(dt[is.na(offset), CHR])
+  stop("Some CHR values were not found in genome_offsets.tsv. Examples: ",
+       paste(head(missing, 10), collapse = ", "))
+}
 dt[, BPcum := POS + offset]
 
 # Cap y for plotting only
 dt[, logP_plot := pmin(logP, Y_CAP)]
+
+# -----------------------------
+# Select significant points to label (top N)
+# -----------------------------
+sig_to_label <- dt[0]
+if (LABEL_TOP_N > 0) {
+  sig_all <- dt[q <= FDR_ALPHA]
+  if (nrow(sig_all) > 0) {
+    sig_all[, label := paste0(CHR, ":", POS)]
+    setorder(sig_all, q, -logP)
+    sig_to_label <- sig_all[1:min(LABEL_TOP_N, .N)]
+    cat("Labeling", nrow(sig_to_label), "significant hits\n")
+  }
+}
+
 # -----------------------------
 # Plot thinning: keep ALL significant, sample ONLY nonsignificant
 # -----------------------------
@@ -211,8 +247,9 @@ if (is.finite(MAX_PLOT_POINTS) && nrow(dt) > MAX_PLOT_POINTS) {
 # -----------------------------
 pplot <- ggplot(dt_plot, aes(BPcum, logP_plot)) +
   geom_point(size = 0.22, alpha = 0.35) +
+  scale_x_continuous(limits = c(0, genome_end)) +
   labs(
-    x = "Genomic position (scaffolds ordered largest → smallest)",
+    x = "Genomic position (scaffolds ordered largest → smallest; shared coordinate system)",
     y = paste0("-log10(p) from Fisher's Exact Test, pair ", PAIR)
   ) +
   theme_classic(base_size = 14) +
@@ -234,6 +271,20 @@ pplot <- pplot +
     aes(BPcum, logP_plot),
     size = 0.38, alpha = 0.95
   )
+
+# Label top hits if ggrepel is available
+if (HAS_GGREPEL && nrow(sig_to_label) > 0) {
+  pplot <- pplot +
+    ggrepel::geom_text_repel(
+      data = sig_to_label,
+      aes(BPcum, logP_plot, label = label),
+      size = 2.6,
+      max.overlaps = Inf,
+      min.segment.length = 0
+    )
+} else if (!HAS_GGREPEL && nrow(sig_to_label) > 0) {
+  cat("NOTE: ggrepel not installed; skipping labels.\n")
+}
 
 cat("Saving PNG:", OUTPNG, "\n")
 if (requireNamespace("ragg", quietly = TRUE)) {
