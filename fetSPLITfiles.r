@@ -1,15 +1,15 @@
 #!/usr/bin/env Rscript
 
 ########################################
-# Plot split PoPoolation2 FET files with BH-FDR (PNG)
-# Uses a shared genome coordinate system from genome_offsets.tsv
+# SNP-level PoPoolation2 FET Manhattan plot (PNG)
+# Shared genome axis + rigorous SNP slimming + working labels (requires ggrepel)
 #
-# Key behavior:
-# - BH-FDR computed on ALL points
-# - Plot shows ALL significant SNPs (q <= FDR_ALPHA)
-# - Thins ONLY the nonsignificant background for readability
-# - Forces identical x-axis across plots using genome_end from offsets file
-# - Optionally labels top significant hits as scaffold:position (ggrepel if available)
+# Designed for your last run characteristics:
+# - ~69.7M SNPs total across 469 .fet files
+# - BH-FDR yields millions of “significant” SNPs (too many to interpret)
+# - Therefore: use SNP-level Bonferroni for “genome-wide significant SNPs”
+# - Then: clump Bonferroni hits by physical distance per scaffold to get independent lead SNPs
+# - Plot: sampled background + highlighted Bonferroni hits + labeled lead SNPs
 #
 # Assumption: value after PAIR is already -log10(p)
 ########################################
@@ -18,7 +18,11 @@ suppressPackageStartupMessages({
   library(data.table)
   library(ggplot2)
 })
-HAS_GGREPEL <- requireNamespace("ggrepel", quietly = TRUE)
+
+# Require ggrepel up front so you don't waste a big run with no labels
+if (!requireNamespace("ggrepel", quietly = TRUE)) {
+  stop("ggrepel is not installed in this R environment. Install: conda install -c conda-forge r-ggrepel")
+}
 
 # -----------------------------
 # EDIT THESE
@@ -28,10 +32,17 @@ OFFSETS  <- "/hb/groups/kay_lab/popoolation2/populations/LP2/genome_offsets.tsv"
 PAIR     <- "1:2="
 
 OUTDIR   <- file.path(FETDIR, "plots")
-OUTPNG   <- file.path(OUTDIR, "fet_manhattan_FDR_keepSigThinBg.png")
+OUTPNG   <- file.path(OUTDIR, "fet_manhattan_SNP_BONF_clumped_labeled.png")
+OUTHITS  <- file.path(OUTDIR, "fet_lead_hits_BONF.tsv")
 
-# FDR level
-FDR_ALPHA <- 0.05
+# -----------------------------
+# Multiple testing and slimming
+# -----------------------------
+BONF_ALPHA <- 0.05          # genome-wide Bonferroni alpha
+
+# Clumping: keep only one lead SNP per +/- CLUMP_BP region per scaffold (for labels/table)
+CLUMP_BP   <- 50000L        # try 50k or 100k
+LABEL_TOP_N <- 40           # label only top N lead SNPs after clumping (0 disables)
 
 # Optional filters (only applied if columns exist)
 MIN_SNPS      <- 1
@@ -39,16 +50,13 @@ MIN_COV       <- -Inf
 MIN_MINCOV    <- -Inf
 
 # Plot controls
-MAX_PLOT_POINTS <- 5e6          # total plotted points = all sig + sampled nonsig
+MAX_PLOT_POINTS <- 1e7      # sampled background points for readability
 PNG_WIDTH_IN    <- 16
 PNG_HEIGHT_IN   <- 6
 PNG_DPI         <- 450
 
 # Optional y cap for readability (set Inf to disable)
-Y_CAP <- Inf   # e.g. 200 if extreme hits squash everything else
-
-# Labeling controls
-LABEL_TOP_N <- 20               # label top N significant hits (set 0 to disable)
+Y_CAP <- Inf
 
 pattern <- "\\.fet$"
 
@@ -66,20 +74,26 @@ dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
 # READ genome offsets (shared coordinate system)
 # -----------------------------
 stopifnot(file.exists(OFFSETS))
-genome <- fread(OFFSETS, sep = "\t", showProgress = FALSE)
+
+genome <- fread(
+  OFFSETS,
+  sep = "\t",
+  colClasses = list(
+    character = "CHR",
+    numeric   = c("LEN", "offset", "end")
+  ),
+  showProgress = FALSE
+)
+
 stopifnot(all(c("CHR","LEN","offset","end") %in% names(genome)))
-
-genome[, CHR := as.character(CHR)]
-genome[, LEN := suppressWarnings(as.numeric(LEN))]
-genome[, offset := suppressWarnings(as.numeric(offset))]
-genome[, end := suppressWarnings(as.numeric(end))]
-genome <- genome[is.finite(LEN) & is.finite(offset) & is.finite(end)]
-
+genome <- genome[is.finite(end) & end > 0]
 stopifnot(nrow(genome) > 0)
+
 genome_end <- max(genome$end, na.rm = TRUE)
 
 cat("Loaded genome offsets:", nrow(genome), "scaffolds\n")
-cat("Shared genome_end:", format(genome_end, scientific = FALSE), "\n")
+cat("Shared genome_end:", sprintf("%.0f", genome_end), "\n")
+stopifnot(genome_end > 1e6)
 
 # -----------------------------
 # Robust read-one split .FET file + parse PAIR column
@@ -126,11 +140,23 @@ read_one_fet <- function(f) {
   pair_col <- pair_cols[which(has_pair)[1]]
 
   # Extract numeric value after PAIR (ASSUMED already -log10(p))
-  dt[, val := suppressWarnings(as.numeric(sub(paste0("^", PAIR), "", get(pair_col))))]
-  dt <- dt[is.finite(val)]
+  dt[, logP := suppressWarnings(as.numeric(sub(paste0("^", PAIR), "", get(pair_col))))]
+  dt <- dt[is.finite(logP)]
   if (nrow(dt) == 0) return(NULL)
 
-  dt[, .(CHR, POS, NSNPS, COV, AVG_MIN_COV, val)]
+  # Optional filters early (cheap)
+  if ("NSNPS" %in% names(dt)) dt <- dt[is.na(NSNPS) | NSNPS >= MIN_SNPS]
+  if ("COV" %in% names(dt)) dt <- dt[is.na(COV) | COV >= MIN_COV]
+  if ("AVG_MIN_COV" %in% names(dt)) dt <- dt[is.na(AVG_MIN_COV) | AVG_MIN_COV >= MIN_MINCOV]
+  if (nrow(dt) == 0) return(NULL)
+
+  # Convert to p (for Bonferroni thresholding)
+  dt[, p := 10^(-logP)]
+  dt[!is.finite(p) | p <= 0, p := .Machine$double.xmin]
+  dt[p > 1, p := 1]
+
+  # Keep only required columns to reduce memory
+  dt[, .(CHR, POS, logP, p)]
 }
 
 cat("Reading split .fet files...\n")
@@ -139,50 +165,13 @@ lst <- Filter(Negate(is.null), lst)
 stopifnot(length(lst) > 0)
 
 dt <- rbindlist(lst, use.names = TRUE, fill = TRUE)
-cat("Combined rows (finite val only):", nrow(dt), "\n")
-
-# -----------------------------
-# OPTIONAL FILTERS
-# -----------------------------
-before <- nrow(dt)
-if ("NSNPS" %in% names(dt)) dt <- dt[is.na(NSNPS) | NSNPS >= MIN_SNPS]
-if ("COV" %in% names(dt)) dt <- dt[is.na(COV) | COV >= MIN_COV]
-if ("AVG_MIN_COV" %in% names(dt)) dt <- dt[is.na(AVG_MIN_COV) | AVG_MIN_COV >= MIN_MINCOV]
-cat("Rows removed by filters:", before - nrow(dt), "\n")
-stopifnot(nrow(dt) > 0)
-
-# -----------------------------
-# IMPORTANT: val is already -log10(p)
-# Convert to p only for BH-FDR
-# -----------------------------
-dt[, logP := val]
-dt[, p := 10^(-logP)]
-dt[!is.finite(p) | p <= 0, p := .Machine$double.xmin]
-dt[p > 1, p := 1]
+cat("Combined rows:", nrow(dt), "\n")
 
 cat("\nlogP range:\n"); print(range(dt$logP, na.rm = TRUE))
-cat("p range (clamped):\n"); print(range(dt$p, na.rm = TRUE))
+cat("p range:\n"); print(range(dt$p, na.rm = TRUE))
 
 # -----------------------------
-# BH-FDR across genome (ALL points)
-# -----------------------------
-cat("\nComputing BH-FDR across", nrow(dt), "tests...\n")
-dt[, q := p.adjust(p, method = "BH")]
-
-sig <- dt[q <= FDR_ALPHA]
-
-if (nrow(sig) == 0) {
-  fdr_line <- NA_real_
-  cat("No SNPs pass FDR <", FDR_ALPHA, "\n")
-} else {
-  p_cut <- max(sig$p, na.rm = TRUE)
-  fdr_line <- -log10(p_cut)
-  cat("FDR", FDR_ALPHA, "threshold p_cut =", format(p_cut, scientific = TRUE),
-      " => -log10(p_cut) =", fdr_line, "\n")
-}
-
-# -----------------------------
-# cumulative coordinate using shared genome offsets
+# Map onto shared genome axis
 # -----------------------------
 dt <- merge(dt, genome[, .(CHR, offset)], by = "CHR", all.x = TRUE, sort = FALSE)
 if (any(is.na(dt$offset))) {
@@ -191,65 +180,91 @@ if (any(is.na(dt$offset))) {
        paste(head(missing, 10), collapse = ", "))
 }
 dt[, BPcum := POS + offset]
-
-# Cap y for plotting only
 dt[, logP_plot := pmin(logP, Y_CAP)]
 
+cat("BPcum range:\n"); print(range(dt$BPcum, na.rm = TRUE))
+
 # -----------------------------
-# Select significant points to label (top N)
+# Bonferroni threshold (SNP-level, genome-wide)
 # -----------------------------
-sig_to_label <- dt[0]
-if (LABEL_TOP_N > 0) {
-  sig_all <- dt[q <= FDR_ALPHA]
-  if (nrow(sig_all) > 0) {
-    sig_all[, label := paste0(CHR, ":", POS)]
-    setorder(sig_all, q, -logP)
-    sig_to_label <- sig_all[1:min(LABEL_TOP_N, .N)]
-    cat("Labeling", nrow(sig_to_label), "significant hits\n")
+m <- nrow(dt)
+bonf_p <- BONF_ALPHA / m
+bonf_logp <- -log10(bonf_p)
+
+cat("\nBonferroni alpha =", BONF_ALPHA,
+    " => p <=", format(bonf_p, scientific = TRUE),
+    " => -log10(p) >=", bonf_logp, "\n")
+
+sig_bonf <- dt[p <= bonf_p]
+cat("Bonferroni-significant SNPs:", nrow(sig_bonf), "\n")
+
+# -----------------------------
+# Clump significant SNPs for independent lead hits (for labels/table)
+# -----------------------------
+lead <- sig_bonf
+if (nrow(lead) > 0) {
+  setorder(lead, p)  # most significant first
+
+  if (is.finite(CLUMP_BP) && CLUMP_BP > 0) {
+    out <- lead[0]
+
+    for (chr in unique(lead$CHR)) {
+      x <- lead[CHR == chr]
+      kept_pos <- numeric(0)
+
+      keep_idx <- logical(nrow(x))
+      for (i in seq_len(nrow(x))) {
+        pos <- x$POS[i]
+        if (length(kept_pos) == 0 || all(abs(pos - kept_pos) > CLUMP_BP)) {
+          keep_idx[i] <- TRUE
+          kept_pos <- c(kept_pos, pos)
+        }
+      }
+      out <- rbind(out, x[keep_idx], use.names = TRUE)
+    }
+    lead <- out
   }
+
+  # Create labels and keep only top N for labeling
+  lead[, label := paste0(CHR, ":", POS)]
+  setorder(lead, p)
+
+  # Write lead hits table
+  fwrite(lead[, .(CHR, POS, BPcum, logP, p)], OUTHITS, sep = "\t")
+  cat("Wrote lead hits:", OUTHITS, "\n")
+} else {
+  # still write an empty file so downstream doesn't break
+  fwrite(data.table(CHR=character(), POS=integer(), BPcum=numeric(), logP=numeric(), p=numeric()),
+         OUTHITS, sep="\t")
+  cat("Wrote empty lead hits:", OUTHITS, "\n")
+}
+
+lead_to_label <- lead[0]
+if (LABEL_TOP_N > 0 && nrow(lead) > 0) {
+  lead_to_label <- lead[1:min(LABEL_TOP_N, .N)]
+  cat("Labeling", nrow(lead_to_label), "lead SNPs\n")
 }
 
 # -----------------------------
-# Plot thinning: keep ALL significant, sample ONLY nonsignificant
+# Background sampling for plotting
 # -----------------------------
 if (is.finite(MAX_PLOT_POINTS) && nrow(dt) > MAX_PLOT_POINTS) {
-  dt_sig    <- dt[q <= FDR_ALPHA]
-  dt_nonsig <- dt[q >  FDR_ALPHA]
-
-  remaining_budget <- MAX_PLOT_POINTS - nrow(dt_sig)
-
-  if (remaining_budget <= 0) {
-    set.seed(1)
-    dt_plot <- dt_sig[sample.int(nrow(dt_sig), MAX_PLOT_POINTS)]
-    cat("NOTE: Significant points exceed MAX_PLOT_POINTS; sampled significant only.\n")
-  } else {
-    set.seed(1)
-    if (nrow(dt_nonsig) > remaining_budget) {
-      dt_plot <- rbind(
-        dt_sig,
-        dt_nonsig[sample.int(nrow(dt_nonsig), remaining_budget)],
-        use.names = TRUE
-      )
-      cat("Plotted ALL significant + sampled nonsignificant background.\n")
-    } else {
-      dt_plot <- dt
-    }
-  }
-
-  cat("Plotting points:", nrow(dt_plot), " (sig kept:", nrow(dt_sig), ")\n")
+  set.seed(1)
+  dt_plot <- dt[sample.int(nrow(dt), MAX_PLOT_POINTS)]
+  cat("Plotting sampled background points:", nrow(dt_plot), "\n")
 } else {
   dt_plot <- dt
-  cat("Plotting all points (no thinning needed).\n")
+  cat("Plotting all points (no sampling needed).\n")
 }
 
 # -----------------------------
-# PLOT (PNG)
+# PLOT
 # -----------------------------
 pplot <- ggplot(dt_plot, aes(BPcum, logP_plot)) +
-  geom_point(size = 0.22, alpha = 0.35) +
+  geom_point(size = 0.22, alpha = 0.22) +
   scale_x_continuous(limits = c(0, genome_end)) +
   labs(
-    x = "Genomic position (scaffolds ordered largest → smallest; shared coordinate system)",
+    x = "Genomic position (shared coordinate; scaffolds ordered largest → smallest)",
     y = paste0("-log10(p) from Fisher's Exact Test, pair ", PAIR)
   ) +
   theme_classic(base_size = 14) +
@@ -260,30 +275,31 @@ pplot <- ggplot(dt_plot, aes(BPcum, logP_plot)) +
     axis.ticks.length = unit(3.0, "mm")
   )
 
-if (is.finite(fdr_line)) {
-  pplot <- pplot + geom_hline(yintercept = min(fdr_line, Y_CAP), linewidth = 0.8, linetype = "dashed")
+# Bonferroni line
+pplot <- pplot +
+  geom_hline(yintercept = min(bonf_logp, Y_CAP), linewidth = 0.8, linetype = "dotted")
+
+# Overlay Bonferroni significant SNPs (all of them, if any)
+if (nrow(sig_bonf) > 0) {
+  pplot <- pplot +
+    geom_point(
+      data = sig_bonf,
+      aes(BPcum, logP_plot),
+      size = 0.6,
+      alpha = 0.95
+    )
 }
 
-# Overlay significant points so they pop (still monochrome)
-pplot <- pplot +
-  geom_point(
-    data = dt_plot[q <= FDR_ALPHA],
-    aes(BPcum, logP_plot),
-    size = 0.38, alpha = 0.95
-  )
-
-# Label top hits if ggrepel is available
-if (HAS_GGREPEL && nrow(sig_to_label) > 0) {
+# Label clumped lead SNPs (top N)
+if (nrow(lead_to_label) > 0) {
   pplot <- pplot +
     ggrepel::geom_text_repel(
-      data = sig_to_label,
+      data = lead_to_label,
       aes(BPcum, logP_plot, label = label),
-      size = 2.6,
+      size = 2.8,
       max.overlaps = Inf,
       min.segment.length = 0
     )
-} else if (!HAS_GGREPEL && nrow(sig_to_label) > 0) {
-  cat("NOTE: ggrepel not installed; skipping labels.\n")
 }
 
 cat("Saving PNG:", OUTPNG, "\n")
